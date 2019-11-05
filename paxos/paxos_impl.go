@@ -12,7 +12,41 @@ import (
 var PROPOSE_TIMEOUT = 15 * time.Second
 
 type paxosNode struct {
-	nodes map[int]*rpc.Client
+	nodes         map[int]*rpc.Client
+	put           chan putRequest
+	get           chan getRequest
+	getPaxosState chan getPaxosStateRequest
+}
+
+type putRequest struct {
+	key   string
+	value interface{}
+}
+
+type getResponse struct {
+	value interface{}
+	ok    bool
+}
+
+type getRequest struct {
+	key      string
+	response chan getResponse
+}
+
+type getPaxosStateRequest struct {
+	key      string
+	response chan getPaxosStateResponse
+}
+
+type getPaxosStateResponse struct {
+	state paxosState
+	ok    bool
+}
+
+type paxosState struct {
+	minProposal      int
+	acceptedProposal int
+	acceptedValue    interface{}
 }
 
 // Desc:
@@ -32,15 +66,17 @@ type paxosNode struct {
 func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, numRetries int, replace bool) (PaxosNode, error) {
 	myNode := new(paxosNode)
 	myNode.nodes = make(map[int]*rpc.Client)
+	myNode.put = make(chan putRequest)
+	myNode.get = make(chan getRequest)
+	myNode.getPaxosState = make(chan getPaxosStateRequest)
 
 	listener, err := net.Listen("tcp", myHostPort)
 	if err != nil {
 		return nil, err
 	}
-	rpcServer := rpc.NewServer()                                   // RPC setup code, from the tutorial
-	rpcServer.Register(paxosrpc.Wrap(myNode))                      // ...
-	http.DefaultServeMux = http.NewServeMux()                      // ...
-	rpcServer.HandleHTTP(rpc.DefaultRPCPath, rpc.DefaultDebugPath) // ...
+	rpcServer := rpc.NewServer()
+	rpcServer.Register(paxosrpc.Wrap(myNode))
+	rpcServer.HandleHTTP(rpc.DefaultRPCPath, rpc.DefaultDebugPath)
 	go http.Serve(listener, nil)
 
 	for nodeID, node := range hostMap {
@@ -55,7 +91,8 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, nu
 			time.Sleep(time.Duration(1) * time.Second)
 		}
 	}
-
+	go myNode.storeHandler()
+	go myNode.paxosStateHandler()
 	return myNode, nil
 }
 
@@ -68,7 +105,15 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, nu
 // args: the key to propose
 // reply: the next proposal number for the given key
 func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, reply *paxosrpc.ProposalNumberReply) error {
-	return errors.New("not implemented")
+	responseChan := make(chan getPaxosStateResponse)
+	pn.getPaxosState <- getPaxosStateRequest{args.Key, responseChan}
+	response := <-responseChan
+	if !response.ok {
+		reply.N = 1
+	} else {
+		reply.N = response.state.minProposal + 1
+	}
+	return nil
 }
 
 // Desc:
@@ -155,4 +200,29 @@ func (pn *paxosNode) RecvReplaceServer(args *paxosrpc.ReplaceServerArgs, reply *
 // reply: a byte array containing necessary data used by replacement server to recover
 func (pn *paxosNode) RecvReplaceCatchup(args *paxosrpc.ReplaceCatchupArgs, reply *paxosrpc.ReplaceCatchupReply) error {
 	return errors.New("not implemented")
+}
+
+func (pn *paxosNode) storeHandler() {
+	store := make(map[string]interface{})
+
+	for {
+		select {
+		case put := <-pn.put:
+			store[put.key] = put.value
+		case get := <-pn.get:
+			value, ok := store[get.key]
+			get.response <- getResponse{value, ok}
+		}
+	}
+}
+
+func (pn *paxosNode) paxosStateHandler() {
+	paxosStore := make(map[string]paxosState)
+	for {
+		select {
+		case get := <-pn.getPaxosState:
+			value, ok := paxosStore[get.key]
+			get.response <- getPaxosStateResponse{value, ok}
+		}
+	}
 }
