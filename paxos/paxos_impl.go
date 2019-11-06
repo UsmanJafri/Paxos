@@ -12,10 +12,12 @@ import (
 var PROPOSE_TIMEOUT = 15 * time.Second
 
 type paxosNode struct {
+	id            int
 	nodes         map[int]*rpc.Client
 	put           chan putRequest
 	get           chan getRequest
 	getPaxosState chan getPaxosStateRequest
+	putPaxosState chan putPaxosStateRequest
 }
 
 type putRequest struct {
@@ -43,6 +45,11 @@ type getPaxosStateResponse struct {
 	ok    bool
 }
 
+type putPaxosStateRequest struct {
+	key   string
+	value paxosState
+}
+
 type paxosState struct {
 	minProposal      int
 	acceptedProposal int
@@ -65,10 +72,12 @@ type paxosState struct {
 // replace: a flag which indicates whether this node is a replacement for a node which failed.
 func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, numRetries int, replace bool) (PaxosNode, error) {
 	myNode := new(paxosNode)
+	myNode.id = srvId
 	myNode.nodes = make(map[int]*rpc.Client)
 	myNode.put = make(chan putRequest)
 	myNode.get = make(chan getRequest)
 	myNode.getPaxosState = make(chan getPaxosStateRequest)
+	myNode.putPaxosState = make(chan putPaxosStateRequest)
 
 	listener, err := net.Listen("tcp", myHostPort)
 	if err != nil {
@@ -81,6 +90,9 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, nu
 
 	for nodeID, node := range hostMap {
 		for try := 0; try < numRetries; try++ {
+			if nodeID == srvId {
+				node = myHostPort
+			}
 			client, err := rpc.DialHTTP("tcp", node)
 			if err == nil {
 				myNode.nodes[nodeID] = client
@@ -125,7 +137,43 @@ func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, re
 // args: the key, value pair to propose together with the proposal number returned by GetNextProposalNumber
 // reply: value that was actually committed for the given key
 func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply) error {
-	return errors.New("not implemented")
+	prepared := 0
+	accepted := 0
+	// fmt.Println("Node:", pn.id, "Propose", *args)
+	for _, node := range pn.nodes {
+		prepareArgs := paxosrpc.PrepareArgs{args.Key, args.N, pn.id}
+		prepareReply := new(paxosrpc.PrepareReply)
+		err := node.Call("PaxosNode.RecvPrepare", prepareArgs, prepareReply)
+		if err != nil {
+			return err
+		}
+		// fmt.Println("Node:", nodeID, "PrepareReply", *prepareReply)
+		if prepareReply.Status == paxosrpc.OK {
+			prepared++
+		}
+	}
+	for _, node := range pn.nodes {
+		acceptArgs := paxosrpc.AcceptArgs{args.Key, args.N, args.V, pn.id}
+		acceptReply := new(paxosrpc.AcceptReply)
+		err := node.Call("PaxosNode.RecvAccept", acceptArgs, acceptReply)
+		if err != nil {
+			return err
+		}
+		// fmt.Println("Node:", nodeID, "AcceptReply", *acceptReply)
+		if acceptReply.Status == paxosrpc.OK {
+			accepted++
+		}
+	}
+	for _, node := range pn.nodes {
+		commitArgs := paxosrpc.CommitArgs{args.Key, args.V, pn.id}
+		commitReply := new(paxosrpc.CommitReply)
+		err := node.Call("PaxosNode.RecvCommit", commitArgs, commitReply)
+		if err != nil {
+			return err
+		}
+	}
+	reply.V = args.V
+	return nil
 }
 
 // Desc:
@@ -136,7 +184,18 @@ func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.Propose
 // args: the key to check
 // reply: the value and status for this lookup of the given key
 func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetValueReply) error {
-	return errors.New("not implemented")
+	responseChan := make(chan getResponse)
+	pn.get <- getRequest{args.Key, responseChan}
+	response := <-responseChan
+	if response.ok {
+		reply.Status = paxosrpc.KeyFound
+		reply.V = response.value
+	} else {
+		reply.Status = paxosrpc.KeyNotFound
+		reply.V = nil
+	}
+	// fmt.Println("Node: Get", pn.id, *reply)
+	return nil
 }
 
 // Desc:
@@ -149,7 +208,25 @@ func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetVa
 // args: the Prepare Message, you must include RequesterId when you call this API
 // reply: the Prepare Reply Message
 func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.PrepareReply) error {
-	return errors.New("not implemented")
+	responseChan := make(chan getPaxosStateResponse)
+	pn.getPaxosState <- getPaxosStateRequest{args.Key, responseChan}
+	response := <-responseChan
+	if !response.ok {
+		pn.putPaxosState <- putPaxosStateRequest{args.Key, paxosState{args.N, -1, nil}}
+		reply.Status = paxosrpc.OK
+		reply.N_a = -1
+		reply.V_a = nil
+	} else if args.N > response.state.minProposal {
+		pn.putPaxosState <- putPaxosStateRequest{args.Key, paxosState{args.N, -1, nil}}
+		reply.Status = paxosrpc.OK
+		reply.N_a = response.state.acceptedProposal
+		reply.V_a = response.state.acceptedValue
+	} else {
+		reply.Status = paxosrpc.Reject
+		reply.N_a = response.state.acceptedProposal
+		reply.V_a = response.state.acceptedValue
+	}
+	return nil
 }
 
 // Desc:
@@ -162,7 +239,18 @@ func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.Pre
 // args: the Please Accept Message, you must include RequesterId when you call this API
 // reply: the Accept Reply Message
 func (pn *paxosNode) RecvAccept(args *paxosrpc.AcceptArgs, reply *paxosrpc.AcceptReply) error {
-	return errors.New("not implemented")
+	responseChan := make(chan getPaxosStateResponse)
+	pn.getPaxosState <- getPaxosStateRequest{args.Key, responseChan}
+	response := <-responseChan
+	if !response.ok {
+		reply.Status = paxosrpc.Reject
+	} else if args.N >= response.state.minProposal {
+		pn.putPaxosState <- putPaxosStateRequest{args.Key, paxosState{args.N, args.N, args.V}}
+		reply.Status = paxosrpc.OK
+	} else {
+		reply.Status = paxosrpc.Reject
+	}
+	return nil
 }
 
 // Desc:
@@ -174,7 +262,8 @@ func (pn *paxosNode) RecvAccept(args *paxosrpc.AcceptArgs, reply *paxosrpc.Accep
 // args: the Commit Message, you must include RequesterId when you call this API
 // reply: the Commit Reply Message
 func (pn *paxosNode) RecvCommit(args *paxosrpc.CommitArgs, reply *paxosrpc.CommitReply) error {
-	return errors.New("not implemented")
+	pn.put <- putRequest{args.Key, args.V}
+	return nil
 }
 
 // Desc:
@@ -223,6 +312,8 @@ func (pn *paxosNode) paxosStateHandler() {
 		case get := <-pn.getPaxosState:
 			value, ok := paxosStore[get.key]
 			get.response <- getPaxosStateResponse{value, ok}
+		case put := <-pn.putPaxosState:
+			paxosStore[put.key] = put.value
 		}
 	}
 }
