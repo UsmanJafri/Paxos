@@ -117,14 +117,16 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, nu
 // args: the key to propose
 // reply: the next proposal number for the given key
 func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, reply *paxosrpc.ProposalNumberReply) error {
+	delta := 100
 	responseChan := make(chan getPaxosStateResponse)
 	pn.getPaxosState <- getPaxosStateRequest{args.Key, responseChan}
 	response := <-responseChan
 	if !response.ok {
-		reply.N = 1
+		reply.N = delta + pn.id
 	} else {
-		reply.N = response.state.minProposal + 1
+		reply.N = response.state.minProposal - (response.state.minProposal % delta) + delta + pn.id
 	}
+	// fmt.Println(args.Key, reply.N)
 	return nil
 }
 
