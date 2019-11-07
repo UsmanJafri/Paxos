@@ -3,6 +3,7 @@ package paxos
 import (
 	"Paxos/rpc/paxosrpc"
 	"errors"
+	"math"
 	"net"
 	"net/http"
 	"net/rpc"
@@ -142,40 +143,62 @@ func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.Propose
 	prepared := 0
 	accepted := 0
 	// fmt.Println("Node:", pn.id, "Propose", *args)
-	for _, node := range pn.nodes {
-		prepareArgs := paxosrpc.PrepareArgs{args.Key, args.N, pn.id}
-		prepareReply := new(paxosrpc.PrepareReply)
-		err := node.Call("PaxosNode.RecvPrepare", prepareArgs, prepareReply)
-		if err != nil {
-			return err
+	majorityThreshold := int(1 + math.Floor(float64(len(pn.nodes))/float64(2)))
+	resultChannel := make(chan error)
+	go func() {
+		for _, node := range pn.nodes {
+			prepareArgs := paxosrpc.PrepareArgs{args.Key, args.N, pn.id}
+			prepareReply := new(paxosrpc.PrepareReply)
+			err := node.Call("PaxosNode.RecvPrepare", prepareArgs, prepareReply)
+			if err != nil {
+				resultChannel <- err
+				return
+			}
+			// fmt.Println("Node:", nodeID, "PrepareReply", *prepareReply)
+			if prepareReply.Status == paxosrpc.OK {
+				prepared++
+			}
 		}
-		// fmt.Println("Node:", nodeID, "PrepareReply", *prepareReply)
-		if prepareReply.Status == paxosrpc.OK {
-			prepared++
+		if prepared < majorityThreshold {
+			resultChannel <- errors.New("Failed to Prepare a majority")
+			return
 		}
+		for _, node := range pn.nodes {
+			acceptArgs := paxosrpc.AcceptArgs{args.Key, args.N, args.V, pn.id}
+			acceptReply := new(paxosrpc.AcceptReply)
+			err := node.Call("PaxosNode.RecvAccept", acceptArgs, acceptReply)
+			if err != nil {
+				resultChannel <- err
+				return
+			}
+			// fmt.Println("Node:", nodeID, "AcceptReply", *acceptReply)
+			if acceptReply.Status == paxosrpc.OK {
+				accepted++
+			}
+		}
+		if accepted < majorityThreshold {
+			resultChannel <- errors.New("Failed to get accepted by a majority")
+			return
+		}
+		for _, node := range pn.nodes {
+			commitArgs := paxosrpc.CommitArgs{args.Key, args.V, pn.id}
+			commitReply := new(paxosrpc.CommitReply)
+			err := node.Call("PaxosNode.RecvCommit", commitArgs, commitReply)
+			if err != nil {
+				resultChannel <- err
+				return
+			}
+		}
+		reply.V = args.V
+		resultChannel <- nil
+	}()
+	select {
+	case result := <-resultChannel:
+		return result
+	case <-time.After(PROPOSE_TIMEOUT):
+		return errors.New("Propose timed out")
 	}
-	for _, node := range pn.nodes {
-		acceptArgs := paxosrpc.AcceptArgs{args.Key, args.N, args.V, pn.id}
-		acceptReply := new(paxosrpc.AcceptReply)
-		err := node.Call("PaxosNode.RecvAccept", acceptArgs, acceptReply)
-		if err != nil {
-			return err
-		}
-		// fmt.Println("Node:", nodeID, "AcceptReply", *acceptReply)
-		if acceptReply.Status == paxosrpc.OK {
-			accepted++
-		}
-	}
-	for _, node := range pn.nodes {
-		commitArgs := paxosrpc.CommitArgs{args.Key, args.V, pn.id}
-		commitReply := new(paxosrpc.CommitReply)
-		err := node.Call("PaxosNode.RecvCommit", commitArgs, commitReply)
-		if err != nil {
-			return err
-		}
-	}
-	reply.V = args.V
-	return nil
+
 }
 
 // Desc:
