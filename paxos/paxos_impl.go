@@ -3,7 +3,9 @@ package paxos
 import (
 	"Paxos/rpc/paxosrpc"
 	"errors"
+	"fmt"
 	"math"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/rpc"
@@ -140,56 +142,83 @@ func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, re
 // args: the key, value pair to propose together with the proposal number returned by GetNextProposalNumber
 // reply: value that was actually committed for the given key
 func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply) error {
-	prepared := 0
-	accepted := 0
 	// fmt.Println("Node:", pn.id, "Propose", *args)
 	majorityThreshold := int(1 + math.Floor(float64(len(pn.nodes))/float64(2)))
 	resultChannel := make(chan error)
 	go func() {
-		for _, node := range pn.nodes {
-			prepareArgs := paxosrpc.PrepareArgs{args.Key, args.N, pn.id}
-			prepareReply := new(paxosrpc.PrepareReply)
-			err := node.Call("PaxosNode.RecvPrepare", prepareArgs, prepareReply)
-			if err != nil {
-				resultChannel <- err
-				return
+		highestAcceptedProposal := -1
+		acceptedValue := args.V
+		for {
+			prepared := 0
+			for nodeID, node := range pn.nodes {
+				prepareArgs := paxosrpc.PrepareArgs{args.Key, args.N, pn.id}
+				prepareReply := new(paxosrpc.PrepareReply)
+				err := node.Call("PaxosNode.RecvPrepare", prepareArgs, prepareReply)
+				if err != nil {
+					fmt.Println("Failed to call RecvPrepare on node:", nodeID)
+					continue
+				}
+				// fmt.Println("Node:", pn.id, "From:", nodeID, "PrepareReply", *prepareReply)
+				if prepareReply.Status == paxosrpc.OK {
+					prepared++
+				}
+				if prepareReply.N_a != -1 && prepareReply.N_a > highestAcceptedProposal {
+					highestAcceptedProposal = prepareReply.N_a
+					acceptedValue = prepareReply.V_a
+				}
 			}
-			// fmt.Println("Node:", nodeID, "PrepareReply", *prepareReply)
-			if prepareReply.Status == paxosrpc.OK {
-				prepared++
+			if prepared < majorityThreshold {
+				time.Sleep(time.Duration(1+rand.Intn(3)) * time.Second)
+				proposalNumberArgs := paxosrpc.ProposalNumberArgs{args.Key}
+				proposalNumberReply := new(paxosrpc.ProposalNumberReply)
+				err := pn.GetNextProposalNumber(&proposalNumberArgs, proposalNumberReply)
+				if err != nil {
+					fmt.Println("Failed to call GetNextProposalNumber on myself")
+					continue
+				}
+				// fmt.Println("Failed to prepare a majority. Choosing new proposal", args.N, proposalNumberReply.N)
+				args.N = proposalNumberReply.N
+				continue
+			}
+			accepted := 0
+			for nodeID, node := range pn.nodes {
+				acceptArgs := paxosrpc.AcceptArgs{args.Key, args.N, acceptedValue, pn.id}
+				acceptReply := new(paxosrpc.AcceptReply)
+				err := node.Call("PaxosNode.RecvAccept", acceptArgs, acceptReply)
+				if err != nil {
+					fmt.Println("Failed to call RecvAccept on node:", nodeID)
+					continue
+				}
+				// fmt.Println("Node:", nodeID, "AcceptReply", *acceptReply)
+				if acceptReply.Status == paxosrpc.OK {
+					accepted++
+				}
+			}
+			if accepted < majorityThreshold {
+				time.Sleep(time.Duration(1+rand.Intn(3)) * time.Second)
+				proposalNumberArgs := paxosrpc.ProposalNumberArgs{args.Key}
+				proposalNumberReply := new(paxosrpc.ProposalNumberReply)
+				err := pn.GetNextProposalNumber(&proposalNumberArgs, proposalNumberReply)
+				if err != nil {
+					fmt.Println("Failed to call GetNextProposalNumber on myself")
+					continue
+				}
+				// fmt.Println("Failed to accept a majority. Choosing new proposal", args.N, proposalNumberReply.N)
+				args.N = proposalNumberReply.N
+			} else {
+				break
 			}
 		}
-		if prepared < majorityThreshold {
-			resultChannel <- errors.New("Failed to Prepare a majority")
-			return
-		}
-		for _, node := range pn.nodes {
-			acceptArgs := paxosrpc.AcceptArgs{args.Key, args.N, args.V, pn.id}
-			acceptReply := new(paxosrpc.AcceptReply)
-			err := node.Call("PaxosNode.RecvAccept", acceptArgs, acceptReply)
-			if err != nil {
-				resultChannel <- err
-				return
-			}
-			// fmt.Println("Node:", nodeID, "AcceptReply", *acceptReply)
-			if acceptReply.Status == paxosrpc.OK {
-				accepted++
-			}
-		}
-		if accepted < majorityThreshold {
-			resultChannel <- errors.New("Failed to get accepted by a majority")
-			return
-		}
-		for _, node := range pn.nodes {
-			commitArgs := paxosrpc.CommitArgs{args.Key, args.V, pn.id}
+		for nodeID, node := range pn.nodes {
+			commitArgs := paxosrpc.CommitArgs{args.Key, acceptedValue, pn.id}
 			commitReply := new(paxosrpc.CommitReply)
 			err := node.Call("PaxosNode.RecvCommit", commitArgs, commitReply)
 			if err != nil {
-				resultChannel <- err
-				return
+				fmt.Println("Failed to call RecvCommit on node:", nodeID)
+				continue
 			}
 		}
-		reply.V = args.V
+		reply.V = acceptedValue
 		resultChannel <- nil
 	}()
 	select {
@@ -241,16 +270,16 @@ func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.Pre
 		reply.Status = paxosrpc.OK
 		reply.N_a = -1
 		reply.V_a = nil
-	} else if args.N > response.state.minProposal {
-		pn.putPaxosState <- putPaxosStateRequest{args.Key, paxosState{args.N, -1, nil}}
+		return nil
+	}
+	if args.N > response.state.minProposal {
+		pn.putPaxosState <- putPaxosStateRequest{args.Key, paxosState{args.N, response.state.acceptedProposal, response.state.acceptedValue}}
 		reply.Status = paxosrpc.OK
-		reply.N_a = response.state.acceptedProposal
-		reply.V_a = response.state.acceptedValue
 	} else {
 		reply.Status = paxosrpc.Reject
-		reply.N_a = response.state.acceptedProposal
-		reply.V_a = response.state.acceptedValue
 	}
+	reply.N_a = response.state.acceptedProposal
+	reply.V_a = response.state.acceptedValue
 	return nil
 }
 
