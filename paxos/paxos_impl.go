@@ -15,22 +15,17 @@ import (
 var PROPOSE_TIMEOUT = 15 * time.Second
 
 type paxosNode struct {
-	id            int
-	nodes         map[int]*rpc.Client
-	put           chan putRequest
-	get           chan getRequest
-	getPaxosState chan getPaxosStateRequest
-	putPaxosState chan putPaxosStateRequest
+	id    int
+	nodes map[int]*rpc.Client
+	get   chan getRequest
+	put   chan putRequest
 }
 
-type putRequest struct {
-	key   string
-	value interface{}
-}
-
-type getResponse struct {
-	value interface{}
-	ok    bool
+type paxosState struct {
+	minProposal      int
+	acceptedProposal int
+	acceptedValue    interface{}
+	committedValue   interface{}
 }
 
 type getRequest struct {
@@ -38,25 +33,14 @@ type getRequest struct {
 	response chan getResponse
 }
 
-type getPaxosStateRequest struct {
-	key      string
-	response chan getPaxosStateResponse
-}
-
-type getPaxosStateResponse struct {
+type getResponse struct {
 	state paxosState
 	ok    bool
 }
 
-type putPaxosStateRequest struct {
+type putRequest struct {
 	key   string
 	value paxosState
-}
-
-type paxosState struct {
-	minProposal      int
-	acceptedProposal int
-	acceptedValue    interface{}
 }
 
 // Desc:
@@ -77,10 +61,8 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, nu
 	myNode := new(paxosNode)
 	myNode.id = srvId
 	myNode.nodes = make(map[int]*rpc.Client)
-	myNode.put = make(chan putRequest)
 	myNode.get = make(chan getRequest)
-	myNode.getPaxosState = make(chan getPaxosStateRequest)
-	myNode.putPaxosState = make(chan putPaxosStateRequest)
+	myNode.put = make(chan putRequest)
 
 	listener, err := net.Listen("tcp", myHostPort)
 	if err != nil {
@@ -93,9 +75,6 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, nu
 
 	for nodeID, node := range hostMap {
 		for try := 0; try < numRetries; try++ {
-			if nodeID == srvId {
-				node = myHostPort
-			}
 			client, err := rpc.DialHTTP("tcp", node)
 			if err == nil {
 				myNode.nodes[nodeID] = client
@@ -106,7 +85,6 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, nu
 			time.Sleep(time.Duration(1) * time.Second)
 		}
 	}
-	go myNode.storeHandler()
 	go myNode.paxosStateHandler()
 	return myNode, nil
 }
@@ -121,15 +99,14 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, nu
 // reply: the next proposal number for the given key
 func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, reply *paxosrpc.ProposalNumberReply) error {
 	delta := 100
-	responseChan := make(chan getPaxosStateResponse)
-	pn.getPaxosState <- getPaxosStateRequest{args.Key, responseChan}
+	responseChan := make(chan getResponse)
+	pn.get <- getRequest{args.Key, responseChan}
 	response := <-responseChan
 	if !response.ok {
 		reply.N = delta + pn.id
 	} else {
 		reply.N = response.state.minProposal - (response.state.minProposal % delta) + delta + pn.id
 	}
-	// fmt.Println(args.Key, reply.N)
 	return nil
 }
 
@@ -158,7 +135,6 @@ func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.Propose
 					fmt.Println("Failed to call RecvPrepare on node:", nodeID)
 					continue
 				}
-				// fmt.Println("Node:", pn.id, "From:", nodeID, "PrepareReply", *prepareReply)
 				if prepareReply.Status == paxosrpc.OK {
 					prepared++
 				}
@@ -176,7 +152,6 @@ func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.Propose
 					fmt.Println("Failed to call GetNextProposalNumber on myself")
 					continue
 				}
-				// fmt.Println("Failed to prepare a majority. Choosing new proposal", args.N, proposalNumberReply.N)
 				args.N = proposalNumberReply.N
 				continue
 			}
@@ -243,7 +218,7 @@ func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetVa
 	response := <-responseChan
 	if response.ok {
 		reply.Status = paxosrpc.KeyFound
-		reply.V = response.value
+		reply.V = response.state.committedValue
 	} else {
 		reply.Status = paxosrpc.KeyNotFound
 		reply.V = nil
@@ -262,18 +237,18 @@ func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetVa
 // args: the Prepare Message, you must include RequesterId when you call this API
 // reply: the Prepare Reply Message
 func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.PrepareReply) error {
-	responseChan := make(chan getPaxosStateResponse)
-	pn.getPaxosState <- getPaxosStateRequest{args.Key, responseChan}
+	responseChan := make(chan getResponse)
+	pn.get <- getRequest{args.Key, responseChan}
 	response := <-responseChan
 	if !response.ok {
-		pn.putPaxosState <- putPaxosStateRequest{args.Key, paxosState{args.N, -1, nil}}
+		pn.put <- putRequest{args.Key, paxosState{args.N, -1, nil, nil}}
 		reply.Status = paxosrpc.OK
 		reply.N_a = -1
 		reply.V_a = nil
 		return nil
 	}
 	if args.N > response.state.minProposal {
-		pn.putPaxosState <- putPaxosStateRequest{args.Key, paxosState{args.N, response.state.acceptedProposal, response.state.acceptedValue}}
+		pn.put <- putRequest{args.Key, paxosState{args.N, response.state.acceptedProposal, response.state.acceptedValue, response.state.committedValue}}
 		reply.Status = paxosrpc.OK
 	} else {
 		reply.Status = paxosrpc.Reject
@@ -293,13 +268,13 @@ func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.Pre
 // args: the Please Accept Message, you must include RequesterId when you call this API
 // reply: the Accept Reply Message
 func (pn *paxosNode) RecvAccept(args *paxosrpc.AcceptArgs, reply *paxosrpc.AcceptReply) error {
-	responseChan := make(chan getPaxosStateResponse)
-	pn.getPaxosState <- getPaxosStateRequest{args.Key, responseChan}
+	responseChan := make(chan getResponse)
+	pn.get <- getRequest{args.Key, responseChan}
 	response := <-responseChan
 	if !response.ok {
 		reply.Status = paxosrpc.Reject
 	} else if args.N >= response.state.minProposal {
-		pn.putPaxosState <- putPaxosStateRequest{args.Key, paxosState{args.N, args.N, args.V}}
+		pn.put <- putRequest{args.Key, paxosState{args.N, args.N, args.V, response.state.committedValue}}
 		reply.Status = paxosrpc.OK
 	} else {
 		reply.Status = paxosrpc.Reject
@@ -316,16 +291,15 @@ func (pn *paxosNode) RecvAccept(args *paxosrpc.AcceptArgs, reply *paxosrpc.Accep
 // args: the Commit Message, you must include RequesterId when you call this API
 // reply: the Commit Reply Message
 func (pn *paxosNode) RecvCommit(args *paxosrpc.CommitArgs, reply *paxosrpc.CommitReply) error {
-	responseChan := make(chan getPaxosStateResponse)
-	pn.getPaxosState <- getPaxosStateRequest{args.Key, responseChan}
+	responseChan := make(chan getResponse)
+	pn.get <- getRequest{args.Key, responseChan}
 	response := <-responseChan
 	if !response.ok {
 		return errors.New("Trying to commit unprepared value")
 	} else if response.state.acceptedValue != args.V {
 		return errors.New("Trying to commit unaccepted value")
 	}
-	pn.put <- putRequest{args.Key, args.V}
-	pn.putPaxosState <- putPaxosStateRequest{args.Key, paxosState{response.state.minProposal, -1, nil}}
+	pn.put <- putRequest{args.Key, paxosState{response.state.minProposal, -1, nil, args.V}}
 	return nil
 }
 
@@ -354,28 +328,15 @@ func (pn *paxosNode) RecvReplaceCatchup(args *paxosrpc.ReplaceCatchupArgs, reply
 	return errors.New("not implemented")
 }
 
-func (pn *paxosNode) storeHandler() {
-	store := make(map[string]interface{})
-	for {
-		select {
-		case put := <-pn.put:
-			store[put.key] = put.value
-		case get := <-pn.get:
-			value, ok := store[get.key]
-			get.response <- getResponse{value, ok}
-		}
-	}
-}
-
 func (pn *paxosNode) paxosStateHandler() {
-	paxosStore := make(map[string]paxosState)
+	state := make(map[string]paxosState)
 	for {
 		select {
-		case get := <-pn.getPaxosState:
-			value, ok := paxosStore[get.key]
-			get.response <- getPaxosStateResponse{value, ok}
-		case put := <-pn.putPaxosState:
-			paxosStore[put.key] = put.value
+		case get := <-pn.get:
+			value, ok := state[get.key]
+			get.response <- getResponse{value, ok}
+		case put := <-pn.put:
+			state[put.key] = put.value
 		}
 	}
 }
