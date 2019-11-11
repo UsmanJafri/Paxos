@@ -316,7 +316,16 @@ func (pn *paxosNode) RecvAccept(args *paxosrpc.AcceptArgs, reply *paxosrpc.Accep
 // args: the Commit Message, you must include RequesterId when you call this API
 // reply: the Commit Reply Message
 func (pn *paxosNode) RecvCommit(args *paxosrpc.CommitArgs, reply *paxosrpc.CommitReply) error {
+	responseChan := make(chan getPaxosStateResponse)
+	pn.getPaxosState <- getPaxosStateRequest{args.Key, responseChan}
+	response := <-responseChan
+	if !response.ok {
+		return errors.New("Trying to commit unprepared value")
+	} else if response.state.acceptedValue != args.V {
+		return errors.New("Trying to commit unaccepted value")
+	}
 	pn.put <- putRequest{args.Key, args.V}
+	pn.putPaxosState <- putPaxosStateRequest{args.Key, paxosState{response.state.minProposal, -1, nil}}
 	return nil
 }
 
@@ -347,7 +356,6 @@ func (pn *paxosNode) RecvReplaceCatchup(args *paxosrpc.ReplaceCatchupArgs, reply
 
 func (pn *paxosNode) storeHandler() {
 	store := make(map[string]interface{})
-
 	for {
 		select {
 		case put := <-pn.put:
