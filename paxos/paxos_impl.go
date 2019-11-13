@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-var PROPOSE_TIMEOUT = 15 * time.Second
+var proposeTimeout = 15 * time.Second
 
 type paxosNode struct {
 	id    int
@@ -21,7 +21,7 @@ type paxosNode struct {
 	put   chan putRequest
 }
 
-type paxosState struct {
+type state struct {
 	minProposal      int
 	acceptedProposal int
 	acceptedValue    interface{}
@@ -34,16 +34,15 @@ type getRequest struct {
 }
 
 type getResponse struct {
-	state paxosState
-	ok    bool
+	ok bool
+	state
 }
 
 type putRequest struct {
 	key   string
-	value paxosState
+	value state
 }
 
-// Desc:
 // NewPaxosNode creates a new PaxosNode. This function should return only when
 // all nodes have joined the ring, and should return a non-nil error if this node
 // could not be started in spite of dialing any other nodes numRetries times.
@@ -57,9 +56,9 @@ type putRequest struct {
 // numNodes: the number of nodes in the ring
 // numRetries: if we can't connect with some nodes in hostMap after numRetries attempts, an error should be returned
 // replace: a flag which indicates whether this node is a replacement for a node which failed.
-func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, numRetries int, replace bool) (PaxosNode, error) {
+func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvID, numRetries int, replace bool) (PaxosNode, error) {
 	myNode := new(paxosNode)
-	myNode.id = srvId
+	myNode.id = srvID
 	myNode.nodes = make(map[int]*rpc.Client)
 	myNode.get = make(chan getRequest)
 	myNode.put = make(chan putRequest)
@@ -105,7 +104,7 @@ func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, re
 	if !response.ok {
 		reply.N = delta + pn.id
 	} else {
-		reply.N = response.state.minProposal - (response.state.minProposal % delta) + delta + pn.id
+		reply.N = response.minProposal - (response.minProposal % delta) + delta + pn.id
 	}
 	return nil
 }
@@ -119,90 +118,15 @@ func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, re
 // args: the key, value pair to propose together with the proposal number returned by GetNextProposalNumber
 // reply: value that was actually committed for the given key
 func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply) error {
-	// fmt.Println("Node:", pn.id, "Propose", *args)
-	majorityThreshold := int(1 + math.Floor(float64(len(pn.nodes))/float64(2)))
-	resultChannel := make(chan error)
-	go func() {
-		highestAcceptedProposal := -1
-		acceptedValue := args.V
-		for {
-			prepared := 0
-			for nodeID, node := range pn.nodes {
-				prepareArgs := paxosrpc.PrepareArgs{args.Key, args.N, pn.id}
-				prepareReply := new(paxosrpc.PrepareReply)
-				err := node.Call("PaxosNode.RecvPrepare", prepareArgs, prepareReply)
-				if err != nil {
-					fmt.Println("Failed to call RecvPrepare on node:", nodeID)
-					continue
-				}
-				if prepareReply.Status == paxosrpc.OK {
-					prepared++
-				}
-				if prepareReply.N_a != -1 && prepareReply.N_a > highestAcceptedProposal {
-					highestAcceptedProposal = prepareReply.N_a
-					acceptedValue = prepareReply.V_a
-				}
-			}
-			if prepared < majorityThreshold {
-				time.Sleep(time.Duration(1+rand.Intn(3)) * time.Second)
-				proposalNumberArgs := paxosrpc.ProposalNumberArgs{args.Key}
-				proposalNumberReply := new(paxosrpc.ProposalNumberReply)
-				err := pn.GetNextProposalNumber(&proposalNumberArgs, proposalNumberReply)
-				if err != nil {
-					fmt.Println("Failed to call GetNextProposalNumber on myself")
-					continue
-				}
-				args.N = proposalNumberReply.N
-				continue
-			}
-			accepted := 0
-			for nodeID, node := range pn.nodes {
-				acceptArgs := paxosrpc.AcceptArgs{args.Key, args.N, acceptedValue, pn.id}
-				acceptReply := new(paxosrpc.AcceptReply)
-				err := node.Call("PaxosNode.RecvAccept", acceptArgs, acceptReply)
-				if err != nil {
-					fmt.Println("Failed to call RecvAccept on node:", nodeID)
-					continue
-				}
-				// fmt.Println("Node:", nodeID, "AcceptReply", *acceptReply)
-				if acceptReply.Status == paxosrpc.OK {
-					accepted++
-				}
-			}
-			if accepted < majorityThreshold {
-				time.Sleep(time.Duration(1+rand.Intn(3)) * time.Second)
-				proposalNumberArgs := paxosrpc.ProposalNumberArgs{args.Key}
-				proposalNumberReply := new(paxosrpc.ProposalNumberReply)
-				err := pn.GetNextProposalNumber(&proposalNumberArgs, proposalNumberReply)
-				if err != nil {
-					fmt.Println("Failed to call GetNextProposalNumber on myself")
-					continue
-				}
-				// fmt.Println("Failed to accept a majority. Choosing new proposal", args.N, proposalNumberReply.N)
-				args.N = proposalNumberReply.N
-			} else {
-				break
-			}
-		}
-		for nodeID, node := range pn.nodes {
-			commitArgs := paxosrpc.CommitArgs{args.Key, acceptedValue, pn.id}
-			commitReply := new(paxosrpc.CommitReply)
-			err := node.Call("PaxosNode.RecvCommit", commitArgs, commitReply)
-			if err != nil {
-				fmt.Println("Failed to call RecvCommit on node:", nodeID)
-				continue
-			}
-		}
-		reply.V = acceptedValue
-		resultChannel <- nil
-	}()
+	result := make(chan interface{})
+	go pn.proposeUntillSuccess(args, result)
 	select {
-	case result := <-resultChannel:
-		return result
-	case <-time.After(PROPOSE_TIMEOUT):
-		return errors.New("Propose timed out")
+	case committedValue := <-result:
+		reply.V = committedValue
+		return nil
+	case <-time.After(proposeTimeout):
+		return errors.New("propose timed out")
 	}
-
 }
 
 // Desc:
@@ -218,7 +142,7 @@ func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetVa
 	response := <-responseChan
 	if response.ok {
 		reply.Status = paxosrpc.KeyFound
-		reply.V = response.state.committedValue
+		reply.V = response.committedValue
 	} else {
 		reply.Status = paxosrpc.KeyNotFound
 		reply.V = nil
@@ -241,20 +165,20 @@ func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.Pre
 	pn.get <- getRequest{args.Key, responseChan}
 	response := <-responseChan
 	if !response.ok {
-		pn.put <- putRequest{args.Key, paxosState{args.N, -1, nil, nil}}
+		pn.put <- putRequest{args.Key, state{args.N, -1, nil, nil}}
 		reply.Status = paxosrpc.OK
 		reply.N_a = -1
 		reply.V_a = nil
 		return nil
 	}
-	if args.N > response.state.minProposal {
-		pn.put <- putRequest{args.Key, paxosState{args.N, response.state.acceptedProposal, response.state.acceptedValue, response.state.committedValue}}
+	if args.N > response.minProposal {
+		pn.put <- putRequest{args.Key, state{args.N, response.acceptedProposal, response.acceptedValue, response.committedValue}}
 		reply.Status = paxosrpc.OK
 	} else {
 		reply.Status = paxosrpc.Reject
 	}
-	reply.N_a = response.state.acceptedProposal
-	reply.V_a = response.state.acceptedValue
+	reply.N_a = response.acceptedProposal
+	reply.V_a = response.acceptedValue
 	return nil
 }
 
@@ -273,8 +197,8 @@ func (pn *paxosNode) RecvAccept(args *paxosrpc.AcceptArgs, reply *paxosrpc.Accep
 	response := <-responseChan
 	if !response.ok {
 		reply.Status = paxosrpc.Reject
-	} else if args.N >= response.state.minProposal {
-		pn.put <- putRequest{args.Key, paxosState{args.N, args.N, args.V, response.state.committedValue}}
+	} else if args.N >= response.minProposal {
+		pn.put <- putRequest{args.Key, state{args.N, args.N, args.V, response.committedValue}}
 		reply.Status = paxosrpc.OK
 	} else {
 		reply.Status = paxosrpc.Reject
@@ -296,10 +220,10 @@ func (pn *paxosNode) RecvCommit(args *paxosrpc.CommitArgs, reply *paxosrpc.Commi
 	response := <-responseChan
 	if !response.ok {
 		return errors.New("Trying to commit unprepared value")
-	} else if response.state.acceptedValue != args.V {
+	} else if response.acceptedValue != args.V {
 		return errors.New("Trying to commit unaccepted value")
 	}
-	pn.put <- putRequest{args.Key, paxosState{response.state.minProposal, -1, nil, args.V}}
+	pn.put <- putRequest{args.Key, state{response.minProposal, -1, nil, args.V}}
 	return nil
 }
 
@@ -329,14 +253,91 @@ func (pn *paxosNode) RecvReplaceCatchup(args *paxosrpc.ReplaceCatchupArgs, reply
 }
 
 func (pn *paxosNode) paxosStateHandler() {
-	state := make(map[string]paxosState)
+	states := make(map[string]state)
 	for {
 		select {
 		case get := <-pn.get:
-			value, ok := state[get.key]
-			get.response <- getResponse{value, ok}
+			value, ok := states[get.key]
+			get.response <- getResponse{ok, value}
 		case put := <-pn.put:
-			state[put.key] = put.value
+			states[put.key] = put.value
 		}
 	}
+}
+
+func (pn *paxosNode) proposeUntillSuccess(args *paxosrpc.ProposeArgs, result chan<- interface{}) {
+	majorityThreshold := int(1 + math.Floor(float64(len(pn.nodes))/float64(2)))
+	highestAcceptedProposal := -1
+	acceptedValue := args.V
+	for {
+		prepared := pn.prepare(args, &highestAcceptedProposal, &acceptedValue)
+		if prepared < majorityThreshold {
+			args.N = pn.getNewProposalNumberDelayed(args.Key)
+		} else {
+			accepted := pn.accept(args, acceptedValue)
+			if accepted < majorityThreshold {
+				args.N = pn.getNewProposalNumberDelayed(args.Key)
+			} else {
+				pn.commit(args.Key, acceptedValue)
+				result <- acceptedValue
+				return
+			}
+		}
+	}
+
+}
+
+func (pn *paxosNode) prepare(args *paxosrpc.ProposeArgs, highestAcceptedProposal *int, acceptedValue *interface{}) int {
+	prepared := 0
+	for nodeID, node := range pn.nodes {
+		prepareArgs := paxosrpc.PrepareArgs{Key: args.Key, N: args.N, RequesterId: pn.id}
+		prepareReply := new(paxosrpc.PrepareReply)
+		err := node.Call("PaxosNode.RecvPrepare", prepareArgs, prepareReply)
+		if err != nil {
+			fmt.Println("Failed to call RecvPrepare on node:", nodeID)
+		} else {
+			if prepareReply.N_a != -1 && prepareReply.N_a > *highestAcceptedProposal {
+				*highestAcceptedProposal = prepareReply.N_a
+				*acceptedValue = prepareReply.V_a
+			}
+			if prepareReply.Status == paxosrpc.OK {
+				prepared++
+			}
+		}
+	}
+	return prepared
+}
+
+func (pn *paxosNode) accept(args *paxosrpc.ProposeArgs, acceptedValue interface{}) int {
+	accepted := 0
+	for nodeID, node := range pn.nodes {
+		acceptArgs := paxosrpc.AcceptArgs{Key: args.Key, N: args.N, V: acceptedValue, RequesterId: pn.id}
+		acceptReply := new(paxosrpc.AcceptReply)
+		err := node.Call("PaxosNode.RecvAccept", acceptArgs, acceptReply)
+		if err != nil {
+			fmt.Println("Failed to call RecvAccept on node:", nodeID)
+		} else if acceptReply.Status == paxosrpc.OK {
+			accepted++
+		}
+	}
+	return accepted
+}
+
+func (pn *paxosNode) commit(key string, value interface{}) {
+	for nodeID, node := range pn.nodes {
+		commitArgs := paxosrpc.CommitArgs{Key: key, V: value, RequesterId: pn.id}
+		commitReply := new(paxosrpc.CommitReply)
+		err := node.Call("PaxosNode.RecvCommit", commitArgs, commitReply)
+		if err != nil {
+			fmt.Println("Failed to call RecvCommit on node:", nodeID)
+		}
+	}
+}
+
+func (pn *paxosNode) getNewProposalNumberDelayed(key string) int {
+	time.Sleep(time.Duration(1+rand.Intn(3)) * time.Second)
+	proposalNumberArgs := paxosrpc.ProposalNumberArgs{Key: key}
+	proposalNumberReply := new(paxosrpc.ProposalNumberReply)
+	pn.GetNextProposalNumber(&proposalNumberArgs, proposalNumberReply)
+	return proposalNumberReply.N
 }
