@@ -2,6 +2,7 @@ package paxos
 
 import (
 	"Paxos/rpc/paxosrpc"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -15,10 +16,11 @@ import (
 var proposeTimeout = 15 * time.Second
 
 type paxosNode struct {
-	id    int
-	nodes map[int]*rpc.Client
-	get   chan getRequest
-	put   chan putRequest
+	id     int
+	nodes  map[int]*rpc.Client
+	put    chan putRequest
+	get    chan getRequest
+	getAll chan chan map[string]state
 }
 
 type state struct {
@@ -60,8 +62,9 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvID, nu
 	myNode := new(paxosNode)
 	myNode.id = srvID
 	myNode.nodes = make(map[int]*rpc.Client)
-	myNode.get = make(chan getRequest)
 	myNode.put = make(chan putRequest)
+	myNode.get = make(chan getRequest)
+	myNode.getAll = make(chan chan map[string]state)
 
 	listener, err := net.Listen("tcp", myHostPort)
 	if err != nil {
@@ -85,6 +88,33 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvID, nu
 		}
 	}
 	go myNode.paxosStateHandler()
+
+	if replace {
+		replaceArgs := paxosrpc.ReplaceServerArgs{srvID, hostMap[srvID]}
+		for _, node := range myNode.nodes {
+			replaceReply := new(paxosrpc.ReplaceServerReply)
+			err := node.Call("PaxosNode.RecvReplaceServer", &replaceArgs, replaceReply)
+			if err != nil {
+				return nil, err
+			}
+		}
+		catchupArgs := paxosrpc.ReplaceCatchupArgs{}
+		for _, node := range myNode.nodes {
+			catchupReply := new(paxosrpc.ReplaceCatchupReply)
+			err := node.Call("PaxosNode.RecvReplaceCatchup", &catchupArgs, catchupReply)
+			if err != nil {
+				return nil, err
+			}
+			states := make(map[string]uint32)
+			err = json.Unmarshal(catchupReply.Data, &states)
+			if err != nil {
+				return nil, err
+			}
+			for k, v := range states {
+				myNode.put <- putRequest{k, state{0, -1, nil, v}}
+			}
+		}
+	}
 	return myNode, nil
 }
 
@@ -236,7 +266,14 @@ func (pn *paxosNode) RecvCommit(args *paxosrpc.CommitArgs, reply *paxosrpc.Commi
 // args: the id and the hostport of the server being replaced
 // reply: no use
 func (pn *paxosNode) RecvReplaceServer(args *paxosrpc.ReplaceServerArgs, reply *paxosrpc.ReplaceServerReply) error {
-	return errors.New("not implemented")
+	client, err := rpc.DialHTTP("tcp", args.Hostport)
+	if err != nil {
+		fmt.Println("Unable to dial replacement node:", err)
+		return err
+	}
+	pn.nodes[args.SrvID].Close()
+	pn.nodes[args.SrvID] = client
+	return nil
 }
 
 // Desc:
@@ -249,7 +286,19 @@ func (pn *paxosNode) RecvReplaceServer(args *paxosrpc.ReplaceServerArgs, reply *
 // args: no use
 // reply: a byte array containing necessary data used by replacement server to recover
 func (pn *paxosNode) RecvReplaceCatchup(args *paxosrpc.ReplaceCatchupArgs, reply *paxosrpc.ReplaceCatchupReply) error {
-	return errors.New("not implemented")
+	response := make(chan map[string]state)
+	pn.getAll <- response
+	allStates := <-response
+	statesToSend := make(map[string]uint32)
+	for k, v := range allStates {
+		statesToSend[k] = v.committedValue.(uint32)
+	}
+	stateAsByteArr, err := json.Marshal(statesToSend)
+	if err != nil {
+		return err
+	}
+	reply.Data = stateAsByteArr
+	return nil
 }
 
 func (pn *paxosNode) paxosStateHandler() {
@@ -261,6 +310,8 @@ func (pn *paxosNode) paxosStateHandler() {
 			get.response <- getResponse{ok, value}
 		case put := <-pn.put:
 			states[put.key] = put.value
+		case getAll := <-pn.getAll:
+			getAll <- states
 		}
 	}
 }
