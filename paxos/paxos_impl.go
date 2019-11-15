@@ -90,8 +90,11 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvID, nu
 	go myNode.paxosStateHandler()
 
 	if replace {
-		replaceArgs := paxosrpc.ReplaceServerArgs{srvID, hostMap[srvID]}
-		for _, node := range myNode.nodes {
+		replaceArgs := paxosrpc.ReplaceServerArgs{SrvID: srvID, Hostport: hostMap[srvID]}
+		for nodeID, node := range myNode.nodes {
+			if nodeID == srvID {
+				continue
+			}
 			replaceReply := new(paxosrpc.ReplaceServerReply)
 			err := node.Call("PaxosNode.RecvReplaceServer", &replaceArgs, replaceReply)
 			if err != nil {
@@ -177,7 +180,6 @@ func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetVa
 		reply.Status = paxosrpc.KeyNotFound
 		reply.V = nil
 	}
-	// fmt.Println("Node: Get", pn.id, *reply)
 	return nil
 }
 
